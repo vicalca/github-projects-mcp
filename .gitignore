@@ -1,1 +1,3 @@
 .cache_ggshield
+.env
+__pycache__

@@ -31,7 +31,7 @@ class GitHubClient:
         if not self.token:
             raise ValueError("GitHub token is required")
 
-        self.api_url = "https://api.github.com/graphql"
+        self.api_url = os.environ.get("GITHUB_API_URL") or "https://api.github.com/graphql"
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -821,6 +821,156 @@ class GitHubClient:
         except GitHubClientError as e:
             logger.error(f"Failed to create issue in {owner}/{repo}: {e}")
             raise
+    
+    async def update_issue_status(
+        self, owner: str, project_number: int, issue_number: int, new_status_name: str
+    ):
+        """
+        Updates the status of a GitHub issue within a ProjectV2.
+
+        Args:
+            owner (str): The username of the owner of the repository/project.
+            project_number (int): The number of the project.
+            issue_number (int): The number of the issue to update.
+            new_status_name (str): The name of the desired status (e.g., "To Do", "In Progress").
+
+        Returns:
+            bool: True if the update was successful, False otherwise.
+        """
+
+        GET_PROJECT_DATA_QUERY = """
+        query getProject($owner: String!, $project_number: Int!) {
+          user(login: $owner) {
+            projectV2(number: $project_number) {
+              id # Project ID
+
+              # Find the 'Status' field and its possible options
+              field(name: "Status") {
+                ... on ProjectV2SingleSelectField {
+                  id # Status Field ID
+                  options {
+                    id # Option ID for each status
+                    name # Name of the status (e.g., "To Do", "In Progress")
+                  }
+                }
+              }
+
+              # Get all items in the project to find the one we want to update
+              items(first: 100) {
+                nodes {
+                  id # Item ID
+                  content {
+                    ... on Issue {
+                      number # Issue number
+                    }
+                    ... on PullRequest {
+                      number # PR number
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+
+        # This mutation updates the value of a specific field (in this case, "Status") for a specific item.
+        UPDATE_ITEM_STATUS_MUTATION = """
+        mutation updateStatus($project_id: ID!, $item_id: ID!, $status_field_id: ID!, $status_option_id: String!) {
+          updateProjectV2ItemFieldValue(
+            input: {
+              projectId: $project_id
+              itemId: $item_id
+              fieldId: $status_field_id
+              value: { 
+                singleSelectOptionId: $status_option_id
+              }
+            }
+          ) {
+            projectV2Item {
+              id
+            }
+          }
+        }
+        """
+
+        # --- Step 1: Fetch all necessary IDs ---
+        logger.debug("Step 1: Fetching project and item data...")
+        variables = {"owner": owner, "project_number": project_number}
+
+        try:
+            response_data = await self.execute_query(GET_PROJECT_DATA_QUERY, variables)
+        except GitHubClientError as e:
+            logger.error(
+                f"Failed to fetch project data for project number {project_number}: {e}"
+            )
+            raise
+
+        try:
+            project_data = response_data["user"]["projectV2"]
+        except (KeyError, TypeError) as e:
+            raise GitHubClientError(f"Error parsing GraphQL response: {e}")
+        
+        project_id = project_data.get("id")
+        status_field = project_data.get("field")
+        items = project_data.get("items", {}).get("nodes", [])
+
+        if not all([project_id, status_field, items]):
+            raise GitHubClientError("Could not find project_id, status_field or items")
+
+        status_field_id = status_field.get("id")
+        status_options = status_field.get("options", [])
+
+        # Find the ID for the desired status name
+        target_status_option_id = None
+        for option in status_options:
+            if option["name"].lower() == new_status_name.lower():
+                target_status_option_id = option["id"]
+                break
+
+        if not target_status_option_id:
+            available_statuses = [opt["name"] for opt in status_options]
+            raise GitHubClientError(
+                f"Error: Status '{new_status_name}' not found."
+                f"Available statuses are: {', '.join(available_statuses)}"
+            )
+
+        # Find the item ID for the target issue number
+        target_item_id = None
+        for item in items:
+            if item.get("content") and item["content"].get("number") == issue_number:
+                target_item_id = item["id"]
+                break
+
+        if not target_item_id:
+            raise GitHubClientError(
+                f"Error: Issue #{issue_number} not found in project #{project_number}."
+            )
+
+        logger.debug("Successfully found all required IDs.")
+        logger.debug(f"  - Project ID: {project_id}")
+        logger.debug(f"  - Item (Issue) ID: {target_item_id}")
+        logger.debug(f"  - Status Field ID: {status_field_id}")
+        logger.debug(f"  - '{new_status_name}' Option ID: {target_status_option_id}")
+
+        # --- Step 2: Execute the update mutation ---
+        logger.debug("\nStep 2: Updating issue status...")
+        mutation_variables = {
+            "project_id": project_id,
+            "item_id": target_item_id,
+            "status_field_id": status_field_id,
+            "status_option_id": target_status_option_id,
+        }
+
+        try:
+            await self.execute_query(
+                UPDATE_ITEM_STATUS_MUTATION, mutation_variables
+            )
+        except GitHubClientError as e:
+            logger.error(f"Failed to update issue with id {target_item_id}: {e}")
+            raise
+
+        return True
 
     async def add_issue_to_project(
         self,
@@ -1009,53 +1159,12 @@ class GitHubClient:
         except GitHubClientError as e:
             logger.error(f"Cannot update item field: {e}")
             raise
-
-        # Prepare value based on its type and field ID convention
-        # This mapping might need refinement based on actual field types fetched separately
+    
         field_value_input: Dict[str, Any] = {}
-
-        # Heuristic based on ID prefix - A better approach would be to fetch field type first
-        if field_id.startswith("PVTSSF_"):  # Single Select Field (assumed prefix)
-            if isinstance(value, str):
-                field_value_input = {"singleSelectOptionId": value}
-            else:
-                raise GitHubClientError(
-                    f"Invalid value type for single select field {field_id}. Expected option ID string."
-                )
-        elif field_id.startswith("PVTIF_"):  # Iteration Field (assumed prefix)
-            if isinstance(value, str):
-                field_value_input = {"iterationId": value}
-            else:
-                raise GitHubClientError(
-                    f"Invalid value type for iteration field {field_id}. Expected iteration ID string."
-                )
-        # Add more field types based on prefixes or fetched field info
-        elif field_id.startswith("PVTF_"):  # Text Field (assumed prefix)
-            if isinstance(value, str):
-                field_value_input = {"text": value}
-            else:  # Attempt to convert
-                field_value_input = {"text": str(value)}
-        elif field_id.startswith("PVTDF_"):  # Date Field (assumed prefix)
-            if isinstance(value, str):  # Assuming date string like YYYY-MM-DD
-                field_value_input = {"date": value}
-            else:
-                raise GitHubClientError(
-                    f"Invalid value type for date field {field_id}. Expected date string (YYYY-MM-DD)."
-                )
-        elif field_id.startswith("PVTNU_"):  # Number Field (assumed prefix)
-            if isinstance(value, (int, float)):
-                field_value_input = {
-                    "number": float(value)
-                }  # GraphQL uses Float for numbers
-            else:
-                raise GitHubClientError(
-                    f"Invalid value type for number field {field_id}. Expected int or float."
-                )
-        else:  # Default to text if type unknown
-            logger.warning(
-                f"Unknown field type for {field_id}. Attempting to set as text."
-            )
-            field_value_input = {"text": str(value)}
+        if type(value) is float or type(value) is int:
+            field_value_input = {"number": value}
+        else:
+            field_value_input = {"text": value}
 
         # Update field value
         update_query = """

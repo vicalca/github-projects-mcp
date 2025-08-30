@@ -1,0 +1,11 @@
+version: '3.9'
+
+services:
+  github-projects-mcp-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - GITHUB_TOKEN
+      - GITHUB_API_URL
+      - PORT

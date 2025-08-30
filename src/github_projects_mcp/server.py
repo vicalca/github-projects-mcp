@@ -374,7 +374,7 @@ async def update_project_item_field(
             # Check if looks like a date?
             pass  # Keep as string if not obviously numeric
 
-        result = await github_client.update_project_item_field(
+        await github_client.update_project_item_field(
             owner,
             project_number,
             item_id,
@@ -391,6 +391,37 @@ async def update_project_item_field(
         logger.error(f"Error updating field {field_id} for item {item_id}: {e}")
         return f"Error: Could not update field value. Details: {e}"
 
+@mcp.tool()
+async def update_issue_status(
+    owner: str, project_number: int, issue_number: int, new_status_name: str
+) -> str:
+    """
+    Updates the status of a GitHub issue within a ProjectV2.
+
+    Args:
+        owner (str): The username of the owner of the repository/project.
+        project_number (int): The number of the project.
+        issue_number (int): The number of the issue to update.
+        new_status_name (str): The name of the desired status (e.g., "To Do", "In Progress").
+
+    Returns:
+        A confirmation message.
+    """
+    try:
+
+        await github_client.update_issue_status(
+            owner,
+            project_number,
+            issue_number,
+            new_status_name,
+        )
+        return (
+            f"Successfully updated status for issue #{issue_number} in project #{project_number}!\n"
+            f"New status: {new_status_name}\n"
+        )
+    except GitHubClientError as e:
+        logger.error(f"Error updating issue #{issue_number} in project {project_number}: {e}")
+        return f"Error: Could not update issue. Details: {e}"
 
 @mcp.tool()
 async def create_draft_issue(
@@ -470,8 +501,8 @@ def main():
         exit(1)
 
     # Run the MCP server
-    mcp.run(transport="stdio")
-
+    # mcp.run(transport="stdio")
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
 
 # Run the main function if executed directly
 if __name__ == "__main__":
